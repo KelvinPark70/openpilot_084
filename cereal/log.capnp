@@ -526,6 +526,8 @@ struct ControlsState @0x97ff69c53601abf1 {
   limitSpeedCamera @62 :Float32;
   limitSpeedCameraDist @63 :Float32;
   steerRatio @64 :Float32;
+  longPlanSource  @65 :UInt8;
+  vCruiseSetPoint @66 :Float32;
 
   lateralControlState :union {
     indiState @52 :LateralINDIState;
@@ -768,6 +770,7 @@ struct LongitudinalPlan @0xe00b5b3eba12876c {
   status2 @38 :Bool;
   targetSpeedCamera @39 :Float32;
   targetSpeedCameraDist @40 :Float32;
+  vCruiseSetPoint @41 :Float64;
 
   enum LongitudinalPlanSource {
     cruise @0;
@@ -1300,6 +1303,19 @@ struct ManagerState {
   }
 }
 
+struct DynamicFollowData {
+  mpcTR @0 :Float32;
+  profilePred @1 :UInt16;
+}
+
+struct DynamicFollowButton {
+  status @0 :UInt16;
+}
+
+struct ModelLongButton {
+  enabled @0 :Bool;
+}
+
 struct Event {
   logMonoTime @0 :UInt64;  # nanoseconds
   valid @67 :Bool = true;
@@ -1396,5 +1412,8 @@ struct Event {
     kalmanOdometryDEPRECATED @65 :Legacy.KalmanOdometry;
     gpsLocationDEPRECATED @21 :GpsLocationData;
     uiLayoutStateDEPRECATED @57 :Legacy.UiLayoutState;
+    dynamicFollowData @79 :DynamicFollowData;
+    dynamicFollowButton @80 :DynamicFollowButton;
+    modelLongButton @81 :ModelLongButton;
   }
 }

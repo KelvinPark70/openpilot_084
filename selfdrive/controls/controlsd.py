@@ -25,6 +25,7 @@ from selfdrive.controls.lib.longitudinal_planner import LON_MPC_STEP
 from selfdrive.locationd.calibrationd import Calibration
 from selfdrive.hardware import HARDWARE, TICI
 from selfdrive.car.hyundai.values import Buttons
+from selfdrive.controls.lib.dynamic_follow.df_manager import dfManager
 
 import common.log as trace1
 
@@ -40,6 +41,7 @@ IGNORE_PROCESSES = set(["rtshield", "uploader", "deleter", "loggerd", "logmessag
 ThermalStatus = log.DeviceState.ThermalStatus
 State = log.ControlsState.OpenpilotState
 PandaType = log.PandaState.PandaType
+LongitudinalPlanSource = log.LongitudinalPlan.LongitudinalPlanSource
 Desire = log.LateralPlan.Desire
 LaneChangeState = log.LateralPlan.LaneChangeState
 LaneChangeDirection = log.LateralPlan.LaneChangeDirection
@@ -61,7 +63,10 @@ class Controls:
       ignore = ['driverCameraState', 'managerState'] if SIMULATION else None
       self.sm = messaging.SubMaster(['deviceState', 'pandaState', 'modelV2', 'liveCalibration',
                                      'driverMonitoringState', 'longitudinalPlan', 'lateralPlan', 'liveLocationKalman',
-                                     'roadCameraState', 'driverCameraState', 'managerState', 'liveParameters', 'radarState'], ignore_alive=ignore)
+                                     'roadCameraState', 'driverCameraState', 'managerState', 'liveParameters', 'radarState', 'dynamicFollowData', 'liveTracks', 'dynamicFollowButton', 'modelLongButton'], ignore_alive=ignore)
+
+    self.df_manager = dfManager()
+    self.last_model_long = False
 
     self.can_sock = can_sock
     if can_sock is None:
@@ -121,6 +126,8 @@ class Controls:
     elif self.CP.lateralTuning.which() == 'lqr':
       self.LaC = LatControlLQR(self.CP)
       self.lateral_control_method = 2
+
+    self.long_plan_source = 0
 
     self.controlsAllowed = False
 
@@ -292,6 +299,31 @@ class Controls:
     #  and self.CP.openpilotLongitudinalControl and CS.vEgo < 0.3:
     #  self.events.add(EventName.noTarget)
 
+    self.add_df_alerts(CS)
+
+  def add_df_alerts(self, CS):
+    self.AM.SA_set_frame(self.sm.frame)
+    self.AM.SA_set_enabled(self.enabled)
+    # alert priority is defined by code location, keeping is highest, then lane speed alert, then auto-df alert
+    if self.sm['modelLongButton'].enabled != self.last_model_long:
+      extra_text_1 = '비활성화!' if self.last_model_long else '활성화!'
+      extra_text_2 = '' if self.last_model_long else ', 모델이 예기치 않게 작동할 수 있음'
+      self.AM.SA_add('modelLongAlert', extra_text_1=extra_text_1, extra_text_2=extra_text_2)
+      return
+
+    df_out = self.df_manager.update()
+    if df_out.changed:
+      df_alert = 'dfButtonAlert'
+      if df_out.is_auto and df_out.last_is_auto:
+        # only show auto alert if engaged, not hiding auto, and time since lane speed alert not showing
+        if CS.cruiseState.enabled:
+          df_alert += 'Silent'
+          self.AM.SA_add(df_alert, extra_text_1=df_out.model_profile_text + ' (auto)')
+          return
+      else:
+        self.AM.SA_add(df_alert, extra_text_1=df_out.user_profile_text, extra_text_2='동적차간거리조절: {} 프로파일 활성화됨'.format(df_out.user_profile_text))
+        return
+
     if self.auto_enabled:
       self.auto_enable( CS )
 
@@ -331,7 +363,7 @@ class Controls:
     # if stock cruise is completely disabled, then we can use our own set speed logic
     self.CP.enableCruise = self.CI.CP.enableCruise
     if not self.CP.enableCruise:
-      self.v_cruise_kph = update_v_cruise(self.v_cruise_kph, CS.buttonEvents, self.enabled)
+      self.v_cruise_kph = update_v_cruise(self.v_cruise_kph, CS.vEgo, CS.gasPressed, CS.buttonEvents, self.enabled, self.is_metric)
       if int(CS.vSetDis)-1 > self.v_cruise_kph:
         self.v_cruise_kph = int(CS.vSetDis)
     elif self.CP.enableCruise and CS.cruiseState.enabled:
@@ -473,8 +505,10 @@ class Controls:
     a_acc_sol = long_plan.aStart + (dt / LON_MPC_STEP) * (long_plan.aTarget - long_plan.aStart)
     v_acc_sol = long_plan.vStart + dt * (a_acc_sol + long_plan.aStart) / 2.0
 
+    extras_loc = {'lead_one': self.sm['radarState'].leadOne, 'mpc_TR': self.sm['dynamicFollowData'].mpcTR,
+                  'live_tracks': self.sm['liveTracks'], 'has_lead': long_plan.hasLead}
     # Gas/Brake PID loop
-    actuators.gas, actuators.brake = self.LoC.update(self.active, CS, v_acc_sol, long_plan.vTargetFuture, a_acc_sol, self.CP)
+    actuators.gas, actuators.brake = self.LoC.update(self.active, CS, v_acc_sol, long_plan.vTargetFuture, long_plan.aTarget, a_acc_sol, self.CP, long_plan.hasLead, self.sm['radarState'], long_plan.longitudinalPlanSource, extras_loc)
 
     # Steering PID loop and lateral MPC
     actuators.steer, actuators.steeringAngleDeg, lac_log = self.LaC.update(self.active, CS, self.CP, self.VM, params, lat_plan)
@@ -526,6 +560,9 @@ class Controls:
     CC.hudControl.speedVisible = self.enabled
     CC.hudControl.lanesVisible = self.enabled
     CC.hudControl.leadVisible = self.sm['longitudinalPlan'].hasLead
+    CC.hudControl.leadDistance = self.sm['radarState'].leadOne.dRel
+    CC.hudControl.leadvRel = self.sm['radarState'].leadOne.vRel
+    CC.hudControl.leadyRel = self.sm['radarState'].leadOne.yRel
 
     right_lane_visible = self.sm['lateralPlan'].rProb > 0.5
     left_lane_visible = self.sm['lateralPlan'].lProb > 0.5
@@ -556,6 +593,8 @@ class Controls:
     clear_event = ET.WARNING if ET.WARNING not in self.current_alert_types else None
     alerts = self.events.create_alerts(self.current_alert_types, [self.CP, self.sm, self.is_metric])
     self.AM.add_many(self.sm.frame, alerts, self.enabled)
+
+    self.last_model_long = self.sm['modelLongButton'].enabled
     self.AM.process_alerts(self.sm.frame, clear_event)
     CC.hudControl.visualAlert = self.AM.visual_alert
 
@@ -614,6 +653,21 @@ class Controls:
     controlsState.limitSpeedCameraDist = float(self.sm['longitudinalPlan'].targetSpeedCameraDist)
     controlsState.lateralControlMethod = int(self.lateral_control_method)
     controlsState.steerRatio = float(self.steerRatio_to_send)
+    controlsState.vCruiseSetPoint = self.sm['longitudinalPlan'].vCruiseSetPoint
+
+    if self.sm['longitudinalPlan'].longitudinalPlanSource == LongitudinalPlanSource.cruise:
+      self.long_plan_source = 1
+    elif self.sm['longitudinalPlan'].longitudinalPlanSource == LongitudinalPlanSource.mpc1:
+      self.long_plan_source = 2
+    elif self.sm['longitudinalPlan'].longitudinalPlanSource == LongitudinalPlanSource.mpc2:
+      self.long_plan_source = 3
+    elif self.sm['longitudinalPlan'].longitudinalPlanSource == LongitudinalPlanSource.mpc3:
+      self.long_plan_source = 4
+    elif self.sm['longitudinalPlan'].longitudinalPlanSource == LongitudinalPlanSource.model:
+      self.long_plan_source = 5
+    else:
+      self.long_plan_source = 0
+    controlsState.longPlanSource = self.long_plan_source
 
     if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
       controlsState.lateralControlState.angleState = lac_log

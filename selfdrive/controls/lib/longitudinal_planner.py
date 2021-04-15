@@ -17,19 +17,25 @@ from selfdrive.controls.lib.longcontrol import LongCtrlState
 from selfdrive.controls.lib.fcw import FCWChecker
 from selfdrive.controls.lib.long_mpc import LongitudinalMpc
 from selfdrive.controls.lib.drive_helpers import V_CRUISE_MAX
+from selfdrive.controls.lib.long_mpc_model import LongitudinalMpcModel
 
 LON_MPC_STEP = 0.2  # first step is 0.2s
 AWARENESS_DECEL = -0.2     # car smoothly decel at .2m/s^2 when user is distracted
 
 # lookup tables VS speed to determine min and max accels in cruise
 # make sure these accelerations are smaller than mpc limits
+_A_CRUISE_MIN_V_ECO = [-1.0, -0.7, -0.6, -0.5, -0.3]
+_A_CRUISE_MIN_V_SPORT = [-3.0, -2.6, -2.3, -2.0, -1.0]
+_A_CRUISE_MIN_V_FOLLOWING = [-3.5, -3.5, -3.5, -2.5, -1.5]
 _A_CRUISE_MIN_V = [-1.0, -.8, -.67, -.5, -.30]
 _A_CRUISE_MIN_BP = [  0.,  5.,  10., 20.,  40.]
 
 # need fast accel at very low speed for stop and go
 # make sure these accelerations are smaller than mpc limits
 _A_CRUISE_MAX_V = [1.2, 1.2, 0.65, .4]
-_A_CRUISE_MAX_V_FOLLOWING = [1.6, 1.6, 0.65, .4]
+_A_CRUISE_MAX_V_ECO = [0.8, 0.9, 1.0, 0.4, 0.2]
+_A_CRUISE_MAX_V_SPORT = [3.0, 3.5, 3.0, 2.0, 2.0]
+_A_CRUISE_MAX_V_FOLLOWING = [1.8, 1.7, 0.8, .6]
 _A_CRUISE_MAX_BP = [0.,  6.4, 22.5, 40.]
 
 # Lookup table for turns
@@ -37,13 +43,26 @@ _A_TOTAL_MAX_V = [1.7, 3.2]
 _A_TOTAL_MAX_BP = [20., 40.]
 
 
-def calc_cruise_accel_limits(v_ego, following):
-  a_cruise_min = interp(v_ego, _A_CRUISE_MIN_BP, _A_CRUISE_MIN_V)
+def calc_cruise_accel_limits(v_ego, following, gas_button_status):
+  if following:
+    a_cruise_min = interp(v_ego, _A_CRUISE_MIN_BP, _A_CRUISE_MIN_V_FOLLOWING)
+  else:
+    if gas_button_status == 1:
+      a_cruise_min = interp(v_ego, _A_CRUISE_MIN_BP, _A_CRUISE_MIN_V_SPORT)
+    elif gas_button_status == 2:
+      a_cruise_min = interp(v_ego, _A_CRUISE_MIN_BP, _A_CRUISE_MIN_V_ECO)
+    else:
+      a_cruise_min = interp(v_ego, _A_CRUISE_MIN_BP, _A_CRUISE_MIN_V)
 
   if following:
     a_cruise_max = interp(v_ego, _A_CRUISE_MAX_BP, _A_CRUISE_MAX_V_FOLLOWING)
   else:
-    a_cruise_max = interp(v_ego, _A_CRUISE_MAX_BP, _A_CRUISE_MAX_V)
+    if gas_button_status == 1:
+      a_cruise_max = interp(v_ego, _A_CRUISE_MAX_BP, _A_CRUISE_MAX_V_SPORT)
+    elif gas_button_status == 2:
+      a_cruise_max = interp(v_ego, _A_CRUISE_MAX_BP, _A_CRUISE_MAX_V_ECO)
+    else:
+      a_cruise_max = interp(v_ego, _A_CRUISE_MAX_BP, _A_CRUISE_MAX_V)
   return np.vstack([a_cruise_min, a_cruise_max])
 
 
@@ -60,12 +79,39 @@ def limit_accel_in_turns(v_ego, angle_steers, a_target, CP):
   return [a_target[0], min(a_target[1], a_x_allowed)]
 
 
+class ModelMpcHelper:
+  def __init__(self):
+    self.model_t = [i ** 2 / 102.4 for i in range(33)]  # the timesteps of the model predictions
+    self.mpc_t = list(range(10))  # the timesteps of what the LongMpcModel class takes in, 1 sec intervels to 10
+    self.model_t_idx = [sorted(range(len(self.model_t)), key=[abs(idx - t) for t in self.model_t].__getitem__)[0] for idx in self.mpc_t]  # matches 0 to 9 interval to idx from t
+    assert len(self.model_t_idx) == 10, 'Needs to be length 10 for mpc'
+
+  def convert_data(self, sm):
+    modelV2 = sm['modelV2']
+    distances, speeds, accelerations = [], [], []
+    if not sm.alive['modelV2'] or len(modelV2.position.x) == 0:
+      return distances, speeds, accelerations
+
+    speeds = [modelV2.velocity.x[t] for t in self.model_t_idx]
+    distances = [modelV2.position.x[t] for t in self.model_t_idx]
+    for t in self.mpc_t:  # todo these three in one loop
+      if 0 < t < 9:
+        accelerations.append((speeds[t + 1] - speeds[t - 1]) / 2)
+
+    # Extrapolate forward and backward at edges
+    accelerations.append(accelerations[-1] - (accelerations[-2] - accelerations[-1]))
+    accelerations.insert(0, accelerations[0] - (accelerations[1] - accelerations[0]))
+    return distances, speeds, accelerations
+
+
 class Planner():
   def __init__(self, CP):
     self.CP = CP
 
     self.mpc1 = LongitudinalMpc(1)
     self.mpc2 = LongitudinalMpc(2)
+    self.mpc_model = LongitudinalMpcModel()
+    self.model_mpc_helper = ModelMpcHelper()
 
     self.v_acc_start = 0.0
     self.a_acc_start = 0.0
@@ -87,7 +133,9 @@ class Planner():
     self.params = Params()
     self.first_loop = True
 
+    self.map_enable = False
     self.target_speed_map = 0.0
+    self.target_speed_map_to_send = 0.0
     self.target_speed_map_counter = 0
     self.target_speed_map_counter_check = False
     self.target_speed_map_counter1 = 0
@@ -99,13 +147,23 @@ class Planner():
     self.tartget_speed_offset = int(self.params.get("OpkrSpeedLimitOffset"))
     self.vego = 0
 
-  def choose_solution(self, v_cruise_setpoint, enabled):
+    self.SC = SpdController()
+    self.model_speed = 0
+    self.lat_mode = 0
+    self.curv_speed = 0
+    self.vcruise_setpoint = 0
+
+  def choose_solution(self, v_cruise_setpoint, enabled, model_enabled):
+    possible_futures = [self.mpc1.v_mpc_future, self.mpc2.v_mpc_future, v_cruise_setpoint]
     if enabled:
       solutions = {'cruise': self.v_cruise}
       if self.mpc1.prev_lead_status:
         solutions['mpc1'] = self.mpc1.v_mpc
       if self.mpc2.prev_lead_status:
         solutions['mpc2'] = self.mpc2.v_mpc
+      if self.mpc_model.valid and model_enabled:
+        solutions['model'] = self.mpc_model.v_mpc
+        possible_futures.append(self.mpc_model.v_mpc_future)  # only used when using model
 
       slowest = min(solutions, key=solutions.get)
 
@@ -120,8 +178,11 @@ class Planner():
       elif slowest == 'cruise':
         self.v_acc = self.v_cruise
         self.a_acc = self.a_cruise
+      elif slowest == 'model':
+        self.v_acc = self.mpc_model.v_mpc
+        self.a_acc = self.mpc_model.a_mpc
 
-    self.v_acc_future = min([self.mpc1.v_mpc_future, self.mpc2.v_mpc_future, v_cruise_setpoint])
+    self.v_acc_future = min(possible_futures)
 
   def update(self, sm, CP):
     """Gets called when new radarState is available"""
@@ -164,16 +225,20 @@ class Planner():
         mapspeed = int(float(mapspeed.rstrip('\n')))
         mapspeeddist = int(float(mapspeeddist.rstrip('\n')))
         if mapspeed > 29:
-          self.target_speed_map = mapspeed
+          self.target_speed_map = (mapspeed*CV.KPH_TO_MS) + ((mapspeed*CV.KPH_TO_MS)*0.01*self.tartget_speed_offset)
+          self.target_speed_map_to_send = mapspeed + mapspeed*0.01*self.tartget_speed_offset
           self.target_speed_map_dist = mapspeeddist
           if self.target_speed_map_dist > 1001:
             self.target_speed_map_block = True
           self.target_speed_map_counter1 = 80
+          self.map_enable = True
           os.system("logcat -c &")
         else:
           self.target_speed_map = 0
+          self.target_speed_map_to_send = 0
           self.target_speed_map_dist = 0
           self.target_speed_map_block = False
+          self.map_enable = False
       elif mapspeed is None and mapspeeddist is None and self.target_speed_map_counter2 < 2:
         self.target_speed_map_counter2 += 1
         self.target_speed_map_counter = 51
@@ -185,15 +250,22 @@ class Planner():
       else:
         self.target_speed_map_counter = 49
         self.target_speed_map_counter2 = 0
+        self.map_enable = False
         self.target_speed_map = 0
+        self.target_speed_map_to_send = 0
         self.target_speed_map_dist = 0
         self.target_speed_map_counter_check = False
         self.target_speed_map_block = False
         self.target_speed_map_sign = False
 
+    self.model_speed = interp(abs(sm['controlsState'].curvature), [0.0002, 0.01], [255, 30])
+    self.curv_speed = interp(abs(self.model_speed), [30, 60, 90, 91], [40, 55, 70, 255])
+    self.curv_speed = self.curv_speed*CV.KPH_TO_MS if v_ego > 8 else 255
+    self.lat_mode = int(self.params.get("OpkrLatMode", encoding='utf8'))
+
     # Calculate speed for normal cruise control
     if enabled and not self.first_loop and not sm['carState'].brakePressed and not sm['carState'].gasPressed:
-      accel_limits = [float(x) for x in calc_cruise_accel_limits(v_ego, following)]
+      accel_limits = [float(x) for x in calc_cruise_accel_limits(v_ego, following, int(self.params.get('OpkrAccMode')))]
       jerk_limits = [min(-0.1, accel_limits[0]), max(0.1, accel_limits[1])]  # TODO: make a separate lookup for jerk tuning
       accel_limits_turns = limit_accel_in_turns(v_ego, sm['carState'].steeringAngleDeg, accel_limits, self.CP)
 
@@ -201,6 +273,19 @@ class Planner():
         # if required so, force a smooth deceleration
         accel_limits_turns[1] = min(accel_limits_turns[1], AWARENESS_DECEL)
         accel_limits_turns[0] = min(accel_limits_turns[0], accel_limits_turns[1])
+
+      cam_distance_calc = 0
+      cam_distance_calc = interp(v_ego*CV.MS_TO_KPH, [30,60,100,160], [3.75,5.5,6,7])
+      consider_speed = interp((v_ego*CV.MS_TO_KPH - self.target_speed_map), [10, 30], [1, 1.3])
+      if self.map_enable and self.target_speed_map_dist < cam_distance_calc*consider_speed*v_ego*CV.MS_TO_KPH:
+        v_cruise_setpoint = min([v_cruise_setpoint, self.target_speed_map])
+        self.target_speed_map_sign = True
+      elif self.map_enable and self.target_speed_map_dist >= cam_distance_calc*consider_speed*v_ego*CV.MS_TO_KPH and self.target_speed_map_block:
+        v_cruise_setpoint = min([v_cruise_setpoint, self.target_speed_map])
+        self.target_speed_map_sign = True
+      elif self.lat_mode == 1:
+        v_cruise_setpoint = min([v_cruise_setpoint, self.curv_speed])
+      self.vcruise_setpoint = v_cruise_setpoint
 
       self.v_cruise, self.a_cruise = speed_smoother(self.v_acc_start, self.a_acc_start,
                                                     v_cruise_setpoint,
@@ -224,11 +309,18 @@ class Planner():
 
     self.mpc1.set_cur_state(self.v_acc_start, self.a_acc_start)
     self.mpc2.set_cur_state(self.v_acc_start, self.a_acc_start)
+    self.mpc_model.set_cur_state(self.v_acc_start, self.a_acc_start)
 
     self.mpc1.update(sm['carState'], lead_1)
     self.mpc2.update(sm['carState'], lead_2)
 
-    self.choose_solution(v_cruise_setpoint, enabled)
+    distances, speeds, accelerations = self.model_mpc_helper.convert_data(sm)
+    self.mpc_model.update(sm['carState'].vEgo, sm['carState'].aEgo,
+                          distances,
+                          speeds,
+                          accelerations)
+
+    self.choose_solution(v_cruise_setpoint, enabled, sm['modelLongButton'].enabled)
 
     # determine fcw
     if self.mpc1.new_lead:
@@ -287,22 +379,11 @@ class Planner():
     longitudinalPlan.yRel2 = float(lead_2.yRel)
     longitudinalPlan.vRel2 = float(lead_2.vRel)
     longitudinalPlan.status2 = bool(lead_2.status)
-    cam_distance_calc = 0
-    cam_distance_calc = interp(self.vego*CV.MS_TO_KPH, [30,60,100,160], [3.75,5.5,6,7])
-    consider_speed = interp((self.vego*CV.MS_TO_KPH - self.target_speed_map), [10, 30], [1, 1.3])
-    if self.target_speed_map > 29 and self.target_speed_map_dist < cam_distance_calc*consider_speed*self.vego*CV.MS_TO_KPH:
-      longitudinalPlan.targetSpeedCamera = float(self.target_speed_map)
-      longitudinalPlan.targetSpeedCameraDist = float(self.target_speed_map_dist)
-      self.target_speed_map_sign = True
-    elif self.target_speed_map > 29 and self.target_speed_map_dist >= cam_distance_calc*consider_speed*self.vego*CV.MS_TO_KPH and self.target_speed_map_block:
-      longitudinalPlan.targetSpeedCamera = float(self.target_speed_map)
-      longitudinalPlan.targetSpeedCameraDist = float(self.target_speed_map_dist)
-      self.target_speed_map_sign = True
-    elif self.target_speed_map > 29 and self.target_speed_map_sign:
-      longitudinalPlan.targetSpeedCamera = float(self.target_speed_map)
-      longitudinalPlan.targetSpeedCameraDist = float(self.target_speed_map_dist)
+
+    if self.target_speed_map_sign:
+      longitudinalPlan.targetSpeedCamera = self.target_speed_map_to_send
     else:
       longitudinalPlan.targetSpeedCamera = 0
-      longitudinalPlan.targetSpeedCameraDist = 0
+    longitudinalPlan.vCruiseSetPoint = float(self.vcruise_setpoint*CV.MS_TO_KPH)
 
     pm.send('longitudinalPlan', plan_send)

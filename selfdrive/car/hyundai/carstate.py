@@ -14,6 +14,8 @@ class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
 
+    self.read_distance_lines = 0
+
     #Auto detection for setup
     self.no_radar = CP.sccBus == -1
     self.mdps_bus = CP.mdpsBus
@@ -44,6 +46,7 @@ class CarState(CarStateBase):
     self.steer_anglecorrection = float(int(Params().get("OpkrSteerAngleCorrection")) * 0.1)
     self.gear_correction = Params().get_bool("JustDoGearD")
 
+    self.pm = messaging.PubMaster(['dynamicFollowButton'])
   def update(self, cp, cp2, cp_cam):
     cp_mdps = cp2 if self.mdps_bus else cp
     cp_sas = cp2 if self.sas_bus else cp
@@ -152,6 +155,13 @@ class CarState(CarStateBase):
       ret.tpmsPressureRr = cp.vl["TPMS11"]['PRESSURE_RR'] / 10 * 14.5038
 
     self.cruiseGapSet = cp_scc.vl["SCC11"]['TauGapSet']
+    ret.cruiseGapSet = self.cruiseGapSet
+
+    if self.read_distance_lines != self.cruiseGapSet:
+      self.read_distance_lines = self.cruiseGapSet
+      msg_df = messaging.new_message('dynamicFollowButton')
+      msg_df.dynamicFollowButton.status = max(self.read_distance_lines - 1, 0)
+      self.pm.send('dynamicFollowButton', msg_df)
 
     # TODO: refactor gear parsing in function
     # Gear Selection via Cluster - For those Kia/Hyundai which are not fully discovered, we can use the Cluster Indicator for Gear Selection,

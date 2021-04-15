@@ -22,7 +22,7 @@ class CarInterface(CarInterfaceBase):
 
   @staticmethod
   def compute_gb(accel, speed):
-    return float(accel) / 3.0
+    return float(accel) / 5.0
 
   @staticmethod
   def get_params(candidate, fingerprint=gen_empty_fingerprint(), car_fw=[]):  # pylint: disable=dangerous-default-value
@@ -204,20 +204,19 @@ class CarInterface(CarInterfaceBase):
     ret.steerRatioRear = 0.
     ret.steerControlType = car.CarParams.SteerControlType.torque
 
-    ret.longitudinalTuning.kpBP = [0., 10., 40.]
-    ret.longitudinalTuning.kpV = [1.2, 0.6, 0.2]
-    ret.longitudinalTuning.kiBP = [0., 10., 30., 40.]
-    ret.longitudinalTuning.kiV = [0.05, 0.02, 0.01, 0.005]
-    ret.longitudinalTuning.deadzoneBP = [0., 40]
-    ret.longitudinalTuning.deadzoneV = [0., 0.02]
+    # TODO: adjust?
+    ret.gasMaxBP = [0.]    # m/s
+    ret.gasMaxV = [1.]    # max gas allowed
+    ret.brakeMaxBP = [0., 4., 8.]  # m/s
+    ret.brakeMaxV = [0.7, 1.0, 1.3]   # max brake allowed
 
+    ret.longitudinalTuning.kpBP = [0., 4., 35.]
+    ret.longitudinalTuning.kpV = [1.5, 1., 0.5]
+    ret.longitudinalTuning.kiBP = [0., 4., 35.]
+    ret.longitudinalTuning.kiV = [0.2, 0.13, 0.07]
 
-    # steer, gas, brake limitations VS speed
-
-    ret.gasMaxBP = [0., 10., 40.]
-    ret.gasMaxV = [0.5, 0.5, 0.5]
-    ret.brakeMaxBP = [0., 20.]
-    ret.brakeMaxV = [1., 0.8]
+    ret.longitudinalTuning.deadzoneBP = [0.]
+    ret.longitudinalTuning.deadzoneV = [0.]
 
     ret.enableCamera = True
 
