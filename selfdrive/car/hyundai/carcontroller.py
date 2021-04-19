@@ -157,6 +157,8 @@ class CarController():
     self.standstill_status_timer = 0
     self.res_switch_timer = 0
     self.auto_res_timer = 0
+    self.res_speed = 0
+    self.res_speed_timer = 0
 
     self.lkas_button_on = True
     self.longcontrol = CP.openpilotLongitudinalControl
@@ -495,9 +497,15 @@ class CarController():
       self.cancel_counter += 1
     elif CS.acc_active:
       self.cancel_counter = 0
+      if self.res_speed_timer > 0:
+        self.res_speed_timer -= 1
+      else: 
+        self.res_speed = 0
 
     if self.model_speed > 95 and self.cancel_counter == 0 and not CS.acc_active and not CS.out.brakeLights and int(CS.VSetDis) > 30 and (CS.lead_distance < 149 or int(CS.clu_Vanz) > 30) and int(CS.clu_Vanz) >= 3 and self.auto_res_timer <= 0 and self.opkr_cruise_auto_res:
       can_sends.append(create_clu11(self.packer, frame, CS.clu11, Buttons.RES_ACCEL))  # auto res
+      self.res_speed = int(CS.clu_Vanz*1.1)
+      self.res_speed_timer = 350
       if self.auto_res_timer <= 0:
         self.auto_res_timer = randint(10, 15)
     elif self.auto_res_timer > 0 and self.opkr_cruise_auto_res:

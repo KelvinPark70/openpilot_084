@@ -311,7 +311,7 @@ class SpdController():
 
 
         # 선행 차량 거리유지
-        lead_wait_cmd, lead_set_speed = self.update_lead( sm, CS, dRel, yRel, vRel)
+        lead_wait_cmd, lead_set_speed = self.update_lead( sm, CS, dRel, yRel, vRel, CC)
 
         # 커브 감속.
         model_speed = CC.model_speed   #cal_model_speed( CS.out.vEgo )
